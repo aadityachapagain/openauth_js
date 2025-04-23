@@ -1,0 +1,46 @@
+name: Deploy Terraform
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  terraform:
+    name: Deploy Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.7.0'
+
+      - name: Configure Terraform Variables
+        run: |
+          cat > terraform.tfvars <<EOF
+          cloudflare_api_token    = "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          cloudflare_account_id   = "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          cloudflare_zone_id      = "${{ secrets.CLOUDFLARE_ZONE_ID }}"
+          auth_secret             = "${{ secrets.AUTH_SECRET }}"
+          google_client_id        = "${{ secrets.GOOGLE_CLIENT_ID }}"
+          google_client_secret    = "${{ secrets.GOOGLE_CLIENT_SECRET }}"
+          google_redirect_uri     = "http://localhost:3000/api/callback"
+          environment             = "dev"
+          EOF
+
+      - name: Configure Provider
+        run: |
+          cat > provider.tf <<EOF
+          provider "cloudflare" {
+            api_token = "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          }
+          EOF
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
