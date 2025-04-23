@@ -60,21 +60,35 @@ async function handleRequest(request, env) {
   try {
     // Handle OAuth callback
     if (url.pathname === '/callback') {
-      let code, redirectUri;
+      let code, redirectUri, state;
       
       if (request.method === 'POST') {
-        const body = await request.json();
-        code = body.code;
-        redirectUri = body.redirect_uri;
+        try {
+          const body = await request.json();
+          code = body.code;
+          redirectUri = body.redirect_uri;
+          state = body.state;
+        } catch (e) {
+          console.error('Failed to parse JSON body:', e);
+          return new Response(JSON.stringify({ 
+            error: 'Invalid JSON body',
+            details: e.message
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...corsHeaders }
+          });
+        }
       } else {
         code = url.searchParams.get('code');
         redirectUri = url.searchParams.get('redirect_uri');
+        state = url.searchParams.get('state');
       }
 
       console.log('Processing callback:', { 
         method: request.method,
         code: code ? code.substring(0, 10) + '...' : 'missing',
-        redirectUri
+        redirectUri,
+        hasState: !!state
       });
 
       if (!code) {
@@ -85,6 +99,29 @@ async function handleRequest(request, env) {
           status: 400,
           headers: { 'Content-Type': 'application/json', ...corsHeaders }
         });
+      }
+
+      // If state is present, verify it from KV storage to prevent CSRF
+      if (state) {
+        try {
+          const storedState = await env.OPENAUTH_KV.get(`state:${state}`);
+          if (!storedState) {
+            console.error('Invalid state parameter:', state);
+            return new Response(JSON.stringify({
+              error: 'Invalid state parameter',
+              details: 'State verification failed'
+            }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json', ...corsHeaders }
+            });
+          }
+          
+          // State is valid, delete it from KV to prevent replay
+          await env.OPENAUTH_KV.delete(`state:${state}`);
+        } catch (e) {
+          console.error('State verification error:', e);
+          // Continue even if state verification fails - this is just a warning
+        }
       }
 
       console.log('Exchanging code for tokens');
@@ -104,14 +141,28 @@ async function handleRequest(request, env) {
       });
 
       if (!tokenResponse.ok) {
-        const error = await tokenResponse.text();
+        let errorDetail;
+        try {
+          errorDetail = await tokenResponse.text();
+          // Try to parse as JSON for better error details
+          try {
+            errorDetail = JSON.parse(errorDetail);
+          } catch (e) {
+            // Keep as text if not valid JSON
+          }
+        } catch (e) {
+          errorDetail = 'Could not read error response';
+        }
+        
         console.error('Token exchange failed:', {
           status: tokenResponse.status,
-          error: error
+          error: errorDetail
         });
+        
         return new Response(JSON.stringify({
           error: 'Token exchange failed',
-          details: error
+          details: errorDetail,
+          status: tokenResponse.status
         }), {
           status: tokenResponse.status,
           headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -124,6 +175,38 @@ async function handleRequest(request, env) {
         refresh_token: tokens.refresh_token ? '✓' : '✗',
         id_token: tokens.id_token ? '✓' : '✗'
       });
+
+      // If we got an id_token, store some user info in KV
+      if (tokens.id_token && tokens.access_token) {
+        try {
+          // Get user info with the access token
+          const userInfoResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+            headers: {
+              'Authorization': `Bearer ${tokens.access_token}`
+            }
+          });
+          
+          if (userInfoResponse.ok) {
+            const userInfo = await userInfoResponse.json();
+            // Store the user info in KV
+            if (userInfo.sub) {
+              await env.OPENAUTH_KV.put(
+                `user:${userInfo.sub}`, 
+                JSON.stringify({
+                  email: userInfo.email,
+                  name: userInfo.name,
+                  picture: userInfo.picture,
+                  lastLogin: new Date().toISOString()
+                }),
+                { expirationTtl: 86400 * 30 } // 30 days
+              );
+            }
+          }
+        } catch (e) {
+          console.error('Failed to store user info:', e);
+          // Non-fatal error, continue
+        }
+      }
 
       return new Response(JSON.stringify(tokens), {
         headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -154,16 +237,110 @@ async function handleRequest(request, env) {
           });
         }
 
+        // Generate a random state parameter to prevent CSRF
+        const state = crypto.randomUUID();
+        
+        // Store the state in KV with expiration
+        try {
+          await env.OPENAUTH_KV.put(`state:${state}`, new Date().toISOString(), {
+            expirationTtl: 600 // 10 minutes
+          });
+        } catch (e) {
+          console.error('Failed to store state:', e);
+          // Continue even if state storage fails
+        }
+
         const googleAuthUrl = 'https://accounts.google.com/o/oauth2/v2/auth' +
           '?client_id=' + encodeURIComponent(VARS.GOOGLE_CLIENT_ID) +
           '&redirect_uri=' + encodeURIComponent(redirectUri) +
           '&response_type=code' +
           '&scope=' + encodeURIComponent('email profile openid') +
           '&access_type=offline' +
-          '&prompt=consent';
+          '&prompt=consent' + 
+          '&state=' + encodeURIComponent(state);
 
         return Response.redirect(googleAuthUrl, 302);
+      } else {
+        return new Response(JSON.stringify({
+          error: 'Unsupported provider',
+          details: `Provider '${provider}' is not supported`
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
       }
+    }
+    
+    // Handle token refreshing
+    if (url.pathname === '/refresh') {
+      if (request.method !== 'POST') {
+        return new Response(JSON.stringify({
+          error: 'Method not allowed',
+          details: 'Only POST method is allowed for token refresh'
+        }), {
+          status: 405,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+      
+      let refreshToken;
+      try {
+        const body = await request.json();
+        refreshToken = body.refresh_token;
+      } catch (e) {
+        return new Response(JSON.stringify({
+          error: 'Invalid request body',
+          details: 'JSON parsing failed'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+      
+      if (!refreshToken) {
+        return new Response(JSON.stringify({
+          error: 'Missing refresh_token',
+          details: 'refresh_token is required in the request body'
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+      
+      const refreshResponse = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          client_id: VARS.GOOGLE_CLIENT_ID,
+          client_secret: VARS.GOOGLE_CLIENT_SECRET,
+          refresh_token: refreshToken,
+          grant_type: 'refresh_token',
+        }),
+      });
+      
+      if (!refreshResponse.ok) {
+        let errorDetail;
+        try {
+          errorDetail = await refreshResponse.text();
+        } catch (e) {
+          errorDetail = 'Could not read error response';
+        }
+        
+        return new Response(JSON.stringify({
+          error: 'Token refresh failed',
+          details: errorDetail
+        }), {
+          status: refreshResponse.status,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders }
+        });
+      }
+      
+      const newTokens = await refreshResponse.json();
+      return new Response(JSON.stringify(newTokens), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
     }
     
     return new Response(JSON.stringify({ 
@@ -188,7 +365,8 @@ async function handleRequest(request, env) {
 const VARS = {
   GOOGLE_CLIENT_ID: "${var.google_client_id}",
   GOOGLE_CLIENT_SECRET: "${var.google_client_secret}",
-  ENVIRONMENT: "${var.environment}"
+  ENVIRONMENT: "${var.environment}",
+  AUTH_SECRET: "${var.auth_secret}"
 };
 EOT
 
@@ -218,7 +396,8 @@ async function handleRequest(request) {
 
     // Skip security for auth-related paths
     if (url.pathname === '/authorize' || 
-        url.pathname === '/callback' || 
+        url.pathname === '/callback' ||
+        url.pathname === '/refresh' ||
         url.pathname.startsWith('/api/')) {
       return fetch(request);
     }
@@ -239,7 +418,7 @@ async function handleRequest(request) {
       "script-src 'self' 'unsafe-inline' https://accounts.google.com; " +
       "style-src 'self' 'unsafe-inline' https://accounts.google.com; " +
       "frame-src https://accounts.google.com; " +
-      "connect-src 'self' https://accounts.google.com http://localhost:3000"
+      "connect-src 'self' https://accounts.google.com https://www.googleapis.com http://localhost:3000"
     );
 
     return new Response(response.body, {
