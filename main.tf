@@ -104,7 +104,8 @@ async function handleRequest(request, env) {
       // If state is present, verify it from KV storage to prevent CSRF
       if (state) {
         try {
-          const storedState = await env.OPENAUTH_KV.get(`state:${state}`);
+          const stateKey = "state:" + state;
+          const storedState = await env.OPENAUTH_KV.get(stateKey);
           if (!storedState) {
             console.error('Invalid state parameter:', state);
             return new Response(JSON.stringify({
@@ -117,7 +118,7 @@ async function handleRequest(request, env) {
           }
           
           // State is valid, delete it from KV to prevent replay
-          await env.OPENAUTH_KV.delete(`state:${state}`);
+          await env.OPENAUTH_KV.delete(stateKey);
         } catch (e) {
           console.error('State verification error:', e);
           // Continue even if state verification fails - this is just a warning
@@ -182,7 +183,7 @@ async function handleRequest(request, env) {
           // Get user info with the access token
           const userInfoResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
             headers: {
-              'Authorization': `Bearer ${tokens.access_token}`
+              'Authorization': 'Bearer ' + tokens.access_token
             }
           });
           
@@ -190,8 +191,9 @@ async function handleRequest(request, env) {
             const userInfo = await userInfoResponse.json();
             // Store the user info in KV
             if (userInfo.sub) {
+              const userKey = "user:" + userInfo.sub;
               await env.OPENAUTH_KV.put(
-                `user:${userInfo.sub}`, 
+                userKey, 
                 JSON.stringify({
                   email: userInfo.email,
                   name: userInfo.name,
@@ -242,7 +244,8 @@ async function handleRequest(request, env) {
         
         // Store the state in KV with expiration
         try {
-          await env.OPENAUTH_KV.put(`state:${state}`, new Date().toISOString(), {
+          const stateKey = "state:" + state;
+          await env.OPENAUTH_KV.put(stateKey, new Date().toISOString(), {
             expirationTtl: 600 // 10 minutes
           });
         } catch (e) {
@@ -263,7 +266,7 @@ async function handleRequest(request, env) {
       } else {
         return new Response(JSON.stringify({
           error: 'Unsupported provider',
-          details: `Provider '${provider}' is not supported`
+          details: 'Provider \'' + provider + '\' is not supported'
         }), {
           status: 400,
           headers: { 'Content-Type': 'application/json', ...corsHeaders }
@@ -376,7 +379,7 @@ EOT
   }
 }
 
-# Security headers worker
+
 resource "cloudflare_workers_script" "security_headers" {
   account_id = var.cloudflare_account_id
   name       = "${local.worker_name}-security"
